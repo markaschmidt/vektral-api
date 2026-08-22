@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "description": "Vektral-API job planner for the current workspace. Handles (1) coding: UI and product edits committed to the vektral/* git branch and live preview, (2) Linear issue create/update/archive when Linear is connected, (3) research/scrape of URLs into a Research pane. The VR client posts spoken intent to POST /api/vocalbridge/query. Do not use Jac or spatial_command.",
+  "verbatim": false
+}
