@@ -112,13 +112,20 @@ async def publish_research(workspace_id: str, uid: str) -> dict[str, Any]:
             workspace_id, uid, title="Research", route=RESEARCH_ROUTE
         )
         pane_id = created.get("id", "")
-    panes_svc.bump_workspace_panes(workspace_id)
+    from app.services import preview as preview_svc
+
+    ready = await preview_svc.wait_preview_routes(workspace_id, [RESEARCH_ROUTE])
+    if not ready:
+        return {"ok": False, "error": "preview runtime or research route not ready"}
+    bumped = panes_svc.bump_pane_reload(pane_id) if pane_id else None
     return {
         "ok": True,
         "pane_id": pane_id,
         "route": RESEARCH_ROUTE,
         "count": int(resp.get("count", len(items)) or len(items)),
         "commit_sha": str(resp.get("commit_sha", "") or ""),
+        "reload_version": int((bumped or {}).get("reload_version") or 0),
+        "affected_pane_ids": [pane_id] if pane_id else [],
     }
 
 
@@ -159,14 +166,15 @@ async def run_research_job(job: dict[str, Any], uid: str) -> dict[str, Any]:
         return job
 
     sess = get_doc("preview_sessions", job.get("workspace_id") or "") or {}
-    base = sess.get("preview_base_url") or ""
+    _ = sess
     job["status"] = "ready"
     job["error"] = ""
     job["pane_id"] = str(published.get("pane_id") or job.get("pane_id") or "")
     job["route"] = RESEARCH_ROUTE
     job["commit_sha"] = str(published.get("commit_sha") or "")
-    job["preview_url"] = f"{base.rstrip('/')}{RESEARCH_ROUTE}" if base else ""
-    job["reload_version"] = int(job.get("reload_version") or 0) + 1
+    job["preview_url"] = ""
+    job["reload_version"] = int(published.get("reload_version") or 0)
+    job["affected_pane_ids"] = list(published.get("affected_pane_ids") or [])
     job["result_json"] = json.dumps(
         {
             "url": url,

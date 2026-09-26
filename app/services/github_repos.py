@@ -9,11 +9,29 @@ from typing import Any
 import httpx
 from fastapi import HTTPException
 
-from app.store import get_store
+from app.services.oauth_refresh import (
+    ensure_github_access_token,
+    reauth_error,
+    upstream_error,
+)
 
 logger = logging.getLogger("vektral.github_repos")
 
 _REPO_NAME_RE = re.compile(r"[^a-z0-9._-]+")
+GITHUB_API_VERSION = "2022-11-28"
+
+
+def github_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Vektral-API",
+        "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    }
+
+
+def _github_token(uid: str, *, force: bool = False) -> str:
+    return ensure_github_access_token(uid, force=force)
 
 
 def slugify_repo_name(name: str) -> str:
@@ -24,6 +42,95 @@ def slugify_repo_name(name: str) -> str:
     return base[:100]
 
 
+def _repo_view(it: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "full_name": it.get("full_name") or "",
+        "html_url": it.get("html_url") or "",
+        "default_branch": it.get("default_branch") or "main",
+        "private": bool(it.get("private")),
+        "description": it.get("description") or "",
+        "pushed_at": it.get("pushed_at") or "",
+        "updated_at": it.get("updated_at") or "",
+        "language": it.get("language") or "",
+        "stargazers_count": int(it.get("stargazers_count") or 0),
+    }
+
+
+def list_user_repos(
+    uid: str,
+    *,
+    page: int = 1,
+    sort: str = "pushed",
+    per_page: int = 100,
+) -> list[dict[str, Any]]:
+    """GET /user/repos — authenticated user repositories (GitHub REST)."""
+    token = _github_token(uid)
+    if not token:
+        return []
+
+    gh_sort = sort.strip().lower()
+    if gh_sort == "name":
+        gh_sort = "full_name"
+    if gh_sort not in {"pushed", "updated", "created", "full_name"}:
+        gh_sort = "pushed"
+    direction = "asc" if gh_sort == "full_name" else "desc"
+    url = "https://api.github.com/user/repos"
+    params = {
+        "visibility": "all",
+        "affiliation": "owner,collaborator,organization_member",
+        "sort": gh_sort,
+        "direction": direction,
+        "per_page": str(per_page),
+        "page": str(page),
+    }
+
+    def _get(tok: str) -> httpx.Response:
+        with httpx.Client(timeout=20.0) as client:
+            return client.get(url, headers=github_headers(tok), params=params)
+
+    try:
+        resp = _get(token)
+        if resp.status_code == 401:
+            token = _github_token(uid, force=True)
+            if not token:
+                raise reauth_error(
+                    "github",
+                    "GitHub access expired. Reconnect GitHub under Integrations.",
+                )
+            resp = _get(token)
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        logger.exception("GitHub repos list request failed")
+        raise upstream_error("github", str(exc)) from exc
+
+    if resp.status_code == 401:
+        raise reauth_error(
+            "github",
+            "GitHub access expired. Reconnect GitHub under Integrations.",
+        )
+    if resp.status_code == 403:
+        logger.warning("GitHub repos list forbidden: %s", resp.text[:200])
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "github_forbidden",
+                "message": "GitHub denied access to repositories. Reconnect with repo permissions.",
+            },
+        )
+    if resp.status_code >= 400:
+        logger.warning("GitHub repos list failed: %s", resp.text[:200])
+        raise upstream_error("github", "failed to list repos")
+
+    items = resp.json()
+    out: list[dict[str, Any]] = []
+    if isinstance(items, list):
+        for it in items:
+            if isinstance(it, dict):
+                out.append(_repo_view(it))
+    return out
+
+
 def create_user_repo(
     uid: str,
     *,
@@ -31,7 +138,7 @@ def create_user_repo(
     description: str = "",
     private: bool = True,
 ) -> dict[str, Any]:
-    token = get_store().github_access_token(uid)
+    token = _github_token(uid)
     if not token:
         raise HTTPException(
             status_code=400,
@@ -53,19 +160,12 @@ def create_user_repo(
         with httpx.Client(timeout=30.0) as client:
             resp = client.post(
                 "https://api.github.com/user/repos",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/vnd.github+json",
-                    "User-Agent": "Vektral-API",
-                },
+                headers=github_headers(token),
                 json=payload,
             )
     except httpx.HTTPError as exc:
         logger.exception("GitHub create repo request failed")
-        raise HTTPException(
-            status_code=502,
-            detail={"error": "github_upstream", "message": str(exc)},
-        ) from exc
+        raise upstream_error("github", str(exc)) from exc
 
     if resp.status_code == 422:
         detail = resp.json() if resp.content else {}
@@ -82,13 +182,7 @@ def create_user_repo(
 
     if resp.status_code >= 400:
         logger.warning("GitHub create repo failed: %s", resp.text[:300])
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "error": "github_upstream",
-                "message": "failed to create GitHub repository",
-            },
-        )
+        raise upstream_error("github", "failed to create GitHub repository")
 
     data = resp.json()
     return {
@@ -105,7 +199,7 @@ def rename_user_repo(
     project_name: str,
 ) -> dict[str, Any]:
     """Rename a GitHub repo to match a workspace title (repo segment only)."""
-    token = get_store().github_access_token(uid)
+    token = _github_token(uid)
     if not token:
         raise HTTPException(
             status_code=400,
@@ -129,19 +223,12 @@ def rename_user_repo(
         with httpx.Client(timeout=30.0) as client:
             resp = client.patch(
                 url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/vnd.github+json",
-                    "User-Agent": "Vektral-API",
-                },
+                headers=github_headers(token),
                 json={"name": new_repo},
             )
     except httpx.HTTPError as exc:
         logger.exception("GitHub rename repo request failed")
-        raise HTTPException(
-            status_code=502,
-            detail={"error": "github_upstream", "message": str(exc)},
-        ) from exc
+        raise upstream_error("github", str(exc)) from exc
 
     if resp.status_code == 404:
         raise HTTPException(
@@ -173,13 +260,7 @@ def rename_user_repo(
         )
     if resp.status_code >= 400:
         logger.warning("GitHub rename repo failed: %s", resp.text[:300])
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "error": "github_upstream",
-                "message": "failed to rename GitHub repository",
-            },
-        )
+        raise upstream_error("github", "failed to rename GitHub repository")
 
     data = resp.json()
     return {
@@ -209,11 +290,7 @@ def verify_repo_access(full_name: str, token: str | None) -> dict[str, Any]:
         with httpx.Client(timeout=15.0) as client:
             resp = client.get(
                 url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/vnd.github+json",
-                    "User-Agent": "Vektral-API",
-                },
+                headers=github_headers(token),
             )
     except httpx.HTTPError as exc:
         logger.warning("GitHub verify repo failed for %s: %s", normalized, exc)

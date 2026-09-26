@@ -8,7 +8,7 @@ from typing import Annotated, Any
 from urllib.parse import quote, urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import HTMLResponse
 from google.api_core import exceptions as gcp_exceptions
 
@@ -16,6 +16,7 @@ from app.config import get_settings
 from app.deps import current_user
 from app.firebase_auth import VerifiedUser
 from app.oauth_redirect import html_redirect, integrations_home, storage_unavailable
+from app.services.oauth_refresh import github_connection_health
 from app.schemas import (
     GithubConnectStart,
     GithubRepoVerifyRequest,
@@ -24,6 +25,7 @@ from app.schemas import (
     GithubStatus,
 )
 from app.store import get_store
+from app.timeutil import expires_at_from_seconds
 
 logger = logging.getLogger("vektral.github")
 
@@ -47,7 +49,7 @@ async def github_status(
     user: Annotated[VerifiedUser, Depends(current_user)],
 ) -> dict[str, Any]:
     try:
-        st = get_store().github_status(user.uid)
+        st = github_connection_health(user.uid)
     except gcp_exceptions.GoogleAPICallError as exc:
         logger.exception("GitHub status Firestore read failed")
         raise storage_unavailable() from exc
@@ -111,63 +113,9 @@ async def list_github_repos(
     per_page: int = Query(100, ge=1, le=100),
 ) -> list[dict[str, Any]]:
     """Wave 3 picker — works when connected; empty list otherwise."""
-    token = get_store().github_access_token(user.uid)
-    if not token:
-        return []
+    from app.services.github_repos import list_user_repos
 
-    gh_sort = sort.strip().lower()
-    if gh_sort == "name":
-        gh_sort = "full_name"
-    if gh_sort not in {"pushed", "updated", "created", "full_name"}:
-        gh_sort = "pushed"
-    direction = "asc" if gh_sort == "full_name" else "desc"
-
-    url = (
-        "https://api.github.com/user/repos"
-        f"?sort={gh_sort}&direction={direction}&per_page={per_page}&page={page}"
-    )
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.get(
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Accept": "application/vnd.github+json",
-                    "User-Agent": "Vektral-API",
-                },
-            )
-            if resp.status_code >= 400:
-                logger.warning("GitHub repos list failed: %s", resp.text[:200])
-                raise HTTPException(
-                    status_code=502,
-                    detail={"error": "github_upstream", "message": "failed to list repos"},
-                )
-            items = resp.json()
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=502,
-            detail={"error": "github_upstream", "message": str(exc)},
-        ) from exc
-
-    out: list[dict[str, Any]] = []
-    if isinstance(items, list):
-        for it in items:
-            out.append(
-                {
-                    "full_name": it.get("full_name") or "",
-                    "html_url": it.get("html_url") or "",
-                    "default_branch": it.get("default_branch") or "main",
-                    "private": bool(it.get("private")),
-                    "description": it.get("description") or "",
-                    "pushed_at": it.get("pushed_at") or "",
-                    "updated_at": it.get("updated_at") or "",
-                    "language": it.get("language") or "",
-                    "stargazers_count": int(it.get("stargazers_count") or 0),
-                }
-            )
-    return out
+    return list_user_repos(user.uid, page=page, sort=sort, per_page=per_page)
 
 
 @router.post("/api/github/repos/verify", response_model=list[GithubRepoVerifyResult])
@@ -177,8 +125,9 @@ async def verify_github_repos(
 ) -> list[dict[str, Any]]:
     """Check whether linked repos still exist and are accessible to the user."""
     from app.services.github_repos import verify_repo_access
+    from app.services.oauth_refresh import ensure_github_access_token
 
-    token = get_store().github_access_token(user.uid)
+    token = ensure_github_access_token(user.uid)
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
     for raw in body.repos:
@@ -239,19 +188,19 @@ async def github_oauth_callback(
             )
             payload = tok.json()
             access = payload.get("access_token") or ""
+            refresh = payload.get("refresh_token") or ""
             scopes = payload.get("scope") or ""
+            expires_in = int(payload.get("expires_in") or 0)
             if not access:
                 return html_redirect(
                     integrations_home("github=error&message=token_exchange_failed")
                 )
 
+            from app.services.github_repos import github_headers
+
             user_resp = await client.get(
                 "https://api.github.com/user",
-                headers={
-                    "Authorization": f"Bearer {access}",
-                    "Accept": "application/vnd.github+json",
-                    "User-Agent": "Vektral-API",
-                },
+                headers=github_headers(access),
             )
             user_json = user_resp.json() if user_resp.status_code < 400 else {}
             login = (user_json.get("login") or "").strip()
@@ -261,7 +210,12 @@ async def github_oauth_callback(
 
     try:
         result = store.github_complete(
-            state, login=login, access_token=access, scopes=scopes
+            state,
+            login=login,
+            access_token=access,
+            scopes=scopes,
+            refresh_token=refresh,
+            expires_at=expires_at_from_seconds(expires_in),
         )
     except gcp_exceptions.GoogleAPICallError:
         logger.exception("GitHub callback Firestore write failed")

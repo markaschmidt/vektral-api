@@ -26,7 +26,8 @@ def html_redirect(url: str) -> HTMLResponse:
 
 
 def integrations_home(query: str = "") -> str:
-    base = f"{get_settings().web_origin}/integrations"
+    """OAuth return URL — integrations live under Account settings."""
+    base = f"{get_settings().web_origin}/account"
     return f"{base}?{query}" if query else base
 
 

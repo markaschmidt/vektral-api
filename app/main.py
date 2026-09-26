@@ -12,6 +12,9 @@ from app.config import get_settings
 from app.firebase_auth import init_firebase
 from app.routers import (
     auth,
+    captures,
+    dialogue,
+    embodiment,
     firecrawl,
     github,
     health,
@@ -63,6 +66,9 @@ app.include_router(panes.router)
 app.include_router(preview.router)
 app.include_router(firecrawl.router)
 app.include_router(jobs.router)
+app.include_router(embodiment.router)
+app.include_router(dialogue.router)
+app.include_router(captures.router)
 
 
 @app.on_event("startup")

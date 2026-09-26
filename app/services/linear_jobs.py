@@ -236,7 +236,12 @@ async def run_linear_job(job: dict[str, Any], uid: str) -> dict[str, Any]:
     if not status.get("connected"):
         return _fail(job, "connect Linear first (Integrations → Linear)")
 
-    token = store.linear_access_token(uid)
+    from app.services.oauth_refresh import ensure_linear_access_token
+
+    try:
+        token = ensure_linear_access_token(uid)
+    except Exception as exc:  # noqa: BLE001
+        return _fail(job, str(exc)[:400])
     if not token:
         return _fail(job, "connect Linear first (Integrations → Linear)")
 

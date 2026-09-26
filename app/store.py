@@ -56,6 +56,9 @@ def workspace_to_view(doc: dict[str, Any]) -> dict[str, Any]:
     linear_team = doc.get("linear_team_id") or None
     if linear_team == "":
         linear_team = None
+    status = str(doc.get("site_status") or "").strip()
+    if not status:
+        status = "ready"
     return {
         "id": doc.get("id") or "",
         "name": doc.get("name") or "",
@@ -71,6 +74,17 @@ def workspace_to_view(doc: dict[str, Any]) -> dict[str, Any]:
         "owner_uid": doc.get("owner_uid") or "",
         "linear_project_id": linear_project,
         "linear_team_id": linear_team,
+        "linear_project_name": (doc.get("linear_project_name") or "").strip() or None,
+        "linear_project_url": (doc.get("linear_project_url") or "").strip() or None,
+        "linear_team_name": (doc.get("linear_team_name") or "").strip() or None,
+        "linear_organization_id": (doc.get("linear_organization_id") or "").strip()
+        or None,
+        "linear_organization_name": (doc.get("linear_organization_name") or "").strip()
+        or None,
+        "site_ready": status == "ready",
+        "site_status": status,
+        "site_error": doc.get("site_error") or "",
+        "site_commit_sha": doc.get("site_commit_sha") or "",
         "created_at": doc.get("created_at") or "",
         "updated_at": doc.get("updated_at") or "",
     }
@@ -192,10 +206,26 @@ class DomainStore(Protocol):
     def github_save_pending(self, state: str, uid: str) -> None: ...
     def github_get_pending(self, state: str) -> dict[str, Any] | None: ...
     def github_complete(
-        self, state: str, *, login: str, access_token: str, scopes: str
+        self,
+        state: str,
+        *,
+        login: str,
+        access_token: str,
+        scopes: str,
+        refresh_token: str = "",
+        expires_at: str = "",
     ) -> dict[str, Any] | None: ...
     def github_disconnect(self, uid: str) -> None: ...
     def github_access_token(self, uid: str) -> str: ...
+    def github_oauth_secrets(self, uid: str) -> dict[str, str]: ...
+    def github_replace_tokens(
+        self,
+        uid: str,
+        *,
+        access_token: str,
+        refresh_token: str | None = None,
+        expires_at: str = "",
+    ) -> None: ...
 
     def linear_status(self, uid: str) -> dict[str, Any]: ...
     def linear_save_pending(self, state: str, uid: str) -> None: ...
@@ -214,6 +244,15 @@ class DomainStore(Protocol):
     ) -> dict[str, Any] | None: ...
     def linear_disconnect(self, uid: str) -> None: ...
     def linear_access_token(self, uid: str) -> str: ...
+    def linear_oauth_secrets(self, uid: str) -> dict[str, str]: ...
+    def linear_replace_tokens(
+        self,
+        uid: str,
+        *,
+        access_token: str,
+        refresh_token: str | None = None,
+        expires_at: str = "",
+    ) -> None: ...
     def linear_set_defaults(
         self, uid: str, *, organization_id: str = "", team_id: str = ""
     ) -> dict[str, Any] | None: ...
@@ -307,6 +346,15 @@ class MemoryStore:
             "thumbnail_url": data.get("thumbnail_url") or None,
             "linear_project_id": (data.get("linear_project_id") or "").strip(),
             "linear_team_id": (data.get("linear_team_id") or "").strip(),
+            "linear_project_name": (data.get("linear_project_name") or "").strip(),
+            "linear_project_url": (data.get("linear_project_url") or "").strip(),
+            "linear_team_name": (data.get("linear_team_name") or "").strip(),
+            "linear_organization_id": (data.get("linear_organization_id") or "").strip(),
+            "linear_organization_name": (data.get("linear_organization_name") or "").strip(),
+            "site_status": data.get("site_status") or ("seeding" if data.get("repo_full_name") else "ready"),
+            "site_ready": bool(data.get("site_ready", not bool(data.get("repo_full_name")))),
+            "site_error": data.get("site_error") or "",
+            "site_commit_sha": data.get("site_commit_sha") or "",
             "created_at": now,
             "updated_at": now,
             "deleted_at": None,
@@ -353,6 +401,18 @@ class MemoryStore:
             "default_branch",
             "thumbnail_url",
             "vektral_branch",
+            "org_id",
+            "linear_project_id",
+            "linear_team_id",
+            "linear_project_name",
+            "linear_project_url",
+            "linear_team_name",
+            "linear_organization_id",
+            "linear_organization_name",
+            "site_status",
+            "site_ready",
+            "site_error",
+            "site_commit_sha",
         ):
             if key in patch and patch[key] is not None:
                 w[key] = patch[key]
@@ -761,7 +821,14 @@ class MemoryStore:
             return deepcopy(p) if p else None
 
     def github_complete(
-        self, state: str, *, login: str, access_token: str, scopes: str
+        self,
+        state: str,
+        *,
+        login: str,
+        access_token: str,
+        scopes: str,
+        refresh_token: str = "",
+        expires_at: str = "",
     ) -> dict[str, Any] | None:
         with self._lock:
             pending = self.pending.get(state)
@@ -774,6 +841,10 @@ class MemoryStore:
                 "connected": True,
                 "login": login,
                 "access_token_encrypted": enc,
+                "refresh_token_encrypted": encrypt_secret(refresh_token)
+                if refresh_token
+                else "",
+                "expires_at": expires_at,
                 "scopes": scopes,
                 "connected_at": now,
             }
@@ -794,9 +865,42 @@ class MemoryStore:
             self.collections.get("users_github", {}).pop(uid, None)
 
     def github_access_token(self, uid: str) -> str:
+        return self.github_oauth_secrets(uid).get("access_token") or ""
+
+    def github_oauth_secrets(self, uid: str) -> dict[str, str]:
         with self._lock:
             g = self.github.get(uid) or {}
-            return decrypt_secret(g.get("access_token_encrypted") or "")
+            return {
+                "access_token": decrypt_secret(g.get("access_token_encrypted") or ""),
+                "refresh_token": decrypt_secret(g.get("refresh_token_encrypted") or ""),
+                "expires_at": g.get("expires_at") or "",
+            }
+
+    def github_replace_tokens(
+        self,
+        uid: str,
+        *,
+        access_token: str,
+        refresh_token: str | None = None,
+        expires_at: str = "",
+    ) -> None:
+        with self._lock:
+            g = self.github.get(uid)
+            if not g:
+                return
+            g["access_token_encrypted"] = encrypt_secret(access_token)
+            if refresh_token is not None:
+                g["refresh_token_encrypted"] = (
+                    encrypt_secret(refresh_token) if refresh_token else ""
+                )
+            if expires_at:
+                g["expires_at"] = expires_at
+            self.collections.setdefault("users_github", {})[uid] = {
+                "uid": uid,
+                "access_token": access_token,
+                "login": g.get("login") or "",
+                "connected_at": g.get("connected_at") or now_iso(),
+            }
 
     def linear_status(self, uid: str) -> dict[str, Any]:
         with self._lock:
@@ -876,9 +980,43 @@ class MemoryStore:
             self.collections.get("users_linear", {}).pop(uid, None)
 
     def linear_access_token(self, uid: str) -> str:
+        return self.linear_oauth_secrets(uid).get("access_token") or ""
+
+    def linear_oauth_secrets(self, uid: str) -> dict[str, str]:
         with self._lock:
             g = self.linear.get(uid) or {}
-            return decrypt_secret(g.get("access_token_encrypted") or "")
+            return {
+                "access_token": decrypt_secret(g.get("access_token_encrypted") or ""),
+                "refresh_token": decrypt_secret(g.get("refresh_token_encrypted") or ""),
+                "expires_at": g.get("expires_at") or "",
+            }
+
+    def linear_replace_tokens(
+        self,
+        uid: str,
+        *,
+        access_token: str,
+        refresh_token: str | None = None,
+        expires_at: str = "",
+    ) -> None:
+        with self._lock:
+            g = self.linear.get(uid)
+            if not g:
+                return
+            g["access_token_encrypted"] = encrypt_secret(access_token)
+            if refresh_token is not None:
+                g["refresh_token_encrypted"] = (
+                    encrypt_secret(refresh_token) if refresh_token else ""
+                )
+            if expires_at:
+                g["expires_at"] = expires_at
+            self.collections.setdefault("users_linear", {})[uid] = {
+                "uid": uid,
+                "access_token": access_token,
+                "user_id": g.get("user_id") or "",
+                "name": g.get("name") or "",
+                "connected_at": g.get("connected_at") or now_iso(),
+            }
 
     def linear_set_defaults(
         self, uid: str, *, organization_id: str = "", team_id: str = ""
@@ -970,6 +1108,15 @@ class FirestoreStore:
             "thumbnail_url": data.get("thumbnail_url") or None,
             "linear_project_id": (data.get("linear_project_id") or "").strip(),
             "linear_team_id": (data.get("linear_team_id") or "").strip(),
+            "linear_project_name": (data.get("linear_project_name") or "").strip(),
+            "linear_project_url": (data.get("linear_project_url") or "").strip(),
+            "linear_team_name": (data.get("linear_team_name") or "").strip(),
+            "linear_organization_id": (data.get("linear_organization_id") or "").strip(),
+            "linear_organization_name": (data.get("linear_organization_name") or "").strip(),
+            "site_status": data.get("site_status") or ("seeding" if data.get("repo_full_name") else "ready"),
+            "site_ready": bool(data.get("site_ready", not bool(data.get("repo_full_name")))),
+            "site_error": data.get("site_error") or "",
+            "site_commit_sha": data.get("site_commit_sha") or "",
             "created_at": now,
             "updated_at": now,
             "deleted_at": None,
@@ -1022,6 +1169,17 @@ class FirestoreStore:
             "thumbnail_url",
             "vektral_branch",
             "org_id",
+            "linear_project_id",
+            "linear_team_id",
+            "linear_project_name",
+            "linear_project_url",
+            "linear_team_name",
+            "linear_organization_id",
+            "linear_organization_name",
+            "site_status",
+            "site_ready",
+            "site_error",
+            "site_commit_sha",
         ):
             if key in patch and patch[key] is not None:
                 updates[key] = patch[key]
@@ -1524,7 +1682,14 @@ class FirestoreStore:
         return snap.to_dict()
 
     def github_complete(
-        self, state: str, *, login: str, access_token: str, scopes: str
+        self,
+        state: str,
+        *,
+        login: str,
+        access_token: str,
+        scopes: str,
+        refresh_token: str = "",
+        expires_at: str = "",
     ) -> dict[str, Any] | None:
         pref = self._db.collection("github_oauth_pending").document(state)
         snap = pref.get()
@@ -1545,6 +1710,10 @@ class FirestoreStore:
                 "connected": True,
                 "login": login,
                 "access_token_encrypted": enc,
+                "refresh_token_encrypted": encrypt_secret(refresh_token)
+                if refresh_token
+                else "",
+                "expires_at": expires_at,
                 "scopes": scopes,
                 "connected_at": now,
             }
@@ -1586,6 +1755,9 @@ class FirestoreStore:
             pass
 
     def github_access_token(self, uid: str) -> str:
+        return self.github_oauth_secrets(uid).get("access_token") or ""
+
+    def github_oauth_secrets(self, uid: str) -> dict[str, str]:
         snap = (
             self._db.collection("users")
             .document(uid)
@@ -1594,9 +1766,44 @@ class FirestoreStore:
             .get()
         )
         if not snap.exists:
-            return ""
+            return {"access_token": "", "refresh_token": "", "expires_at": ""}
         g = snap.to_dict() or {}
-        return decrypt_secret(g.get("access_token_encrypted") or "")
+        return {
+            "access_token": decrypt_secret(g.get("access_token_encrypted") or ""),
+            "refresh_token": decrypt_secret(g.get("refresh_token_encrypted") or ""),
+            "expires_at": g.get("expires_at") or "",
+        }
+
+    def github_replace_tokens(
+        self,
+        uid: str,
+        *,
+        access_token: str,
+        refresh_token: str | None = None,
+        expires_at: str = "",
+    ) -> None:
+        payload: dict[str, Any] = {
+            "access_token_encrypted": encrypt_secret(access_token),
+        }
+        if refresh_token is not None:
+            payload["refresh_token_encrypted"] = (
+                encrypt_secret(refresh_token) if refresh_token else ""
+            )
+        if expires_at:
+            payload["expires_at"] = expires_at
+        self._db.collection("users").document(uid).collection("github").document(
+            "connection"
+        ).set(payload, merge=True)
+        self.raw_put(
+            "users_github",
+            uid,
+            {
+                "uid": uid,
+                "access_token": access_token,
+                "login": (self.github_status(uid).get("github_login") or ""),
+                "connected_at": now_iso(),
+            },
+        )
 
     def linear_status(self, uid: str) -> dict[str, Any]:
         snap = (
@@ -1743,6 +1950,9 @@ class FirestoreStore:
             pass
 
     def linear_access_token(self, uid: str) -> str:
+        return self.linear_oauth_secrets(uid).get("access_token") or ""
+
+    def linear_oauth_secrets(self, uid: str) -> dict[str, str]:
         snap = (
             self._db.collection("users")
             .document(uid)
@@ -1751,9 +1961,46 @@ class FirestoreStore:
             .get()
         )
         if not snap.exists:
-            return ""
+            return {"access_token": "", "refresh_token": "", "expires_at": ""}
         g = snap.to_dict() or {}
-        return decrypt_secret(g.get("access_token_encrypted") or "")
+        return {
+            "access_token": decrypt_secret(g.get("access_token_encrypted") or ""),
+            "refresh_token": decrypt_secret(g.get("refresh_token_encrypted") or ""),
+            "expires_at": g.get("expires_at") or "",
+        }
+
+    def linear_replace_tokens(
+        self,
+        uid: str,
+        *,
+        access_token: str,
+        refresh_token: str | None = None,
+        expires_at: str = "",
+    ) -> None:
+        payload: dict[str, Any] = {
+            "access_token_encrypted": encrypt_secret(access_token),
+        }
+        if refresh_token is not None:
+            payload["refresh_token_encrypted"] = (
+                encrypt_secret(refresh_token) if refresh_token else ""
+            )
+        if expires_at:
+            payload["expires_at"] = expires_at
+        self._db.collection("users").document(uid).collection("linear").document(
+            "connection"
+        ).set(payload, merge=True)
+        status = self.linear_status(uid)
+        self.raw_put(
+            "users_linear",
+            uid,
+            {
+                "uid": uid,
+                "access_token": access_token,
+                "user_id": status.get("linear_user_id") or "",
+                "name": status.get("linear_name") or "",
+                "connected_at": now_iso(),
+            },
+        )
 
     def linear_set_defaults(
         self, uid: str, *, organization_id: str = "", team_id: str = ""

@@ -1,1 +1,21 @@
-[]
+[
+  {
+    "name": "query_agent",
+    "direction": "agent_to_app",
+    "description": "Dispatch the user's verbatim finalized utterance to Vektral. The host POSTs /api/vocalbridge/query and then speaks only agent_response. Do not mutate panes, invent pane ids, or call spatial_command.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "Verbatim user intent for this turn. Do not paraphrase."
+        },
+        "turn_id": {
+          "type": "string",
+          "description": "Stable id for this finalized utterance, 8 to 80 characters. Reuse the host id when one was already assigned."
+        }
+      },
+      "required": ["text", "turn_id"]
+    }
+  }
+]

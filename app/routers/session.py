@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.config import get_settings
 from app.deps import current_profile, current_user
 from app.firebase_auth import VerifiedUser
 from app.services import panes as panes_svc
+from app.services import preview as preview_svc
 from app.services import workspaces as ws_svc
+from app.services.oauth_refresh import ensure_github_access_token, github_connection_health
 from app.store import get_store
 
 router = APIRouter(tags=["session"])
@@ -18,7 +20,7 @@ router = APIRouter(tags=["session"])
 
 def _session_payload(profile: dict[str, Any], uid: str) -> dict[str, Any]:
     store = get_store()
-    gh = store.github_status(uid)
+    gh = github_connection_health(uid)
     lin = store.linear_status(uid)
     settings = get_settings()
     orgs = store.list_orgs(uid)
@@ -47,6 +49,7 @@ def _session_payload(profile: dict[str, Any], uid: str) -> dict[str, Any]:
             "github_login": gh.get("github_login") or "",
             "connected_at": gh.get("connected_at") or "",
             "configured": bool(settings.github_client_id and settings.github_client_secret),
+            "needs_reauth": bool(gh.get("needs_reauth")),
         },
         "linear": {
             "connected": bool(lin.get("connected")),
@@ -84,4 +87,16 @@ async def api_enter_workspace(
     workspace_id: str,
     user: Annotated[VerifiedUser, Depends(current_user)],
 ) -> dict[str, Any]:
+    ws = ws_svc.require_workspace_access(workspace_id, user.uid)
+    if (
+        not ws_svc.is_site_ready(ws)
+        and str(ws.get("repo_full_name") or "").strip()
+    ):
+        token = ""
+        try:
+            token = ensure_github_access_token(user.uid)
+        except HTTPException:
+            token = ""
+        if token:
+            await preview_svc.seed_starter_checkout(workspace_id, user.uid)
     return ws_svc.enter_workspace(workspace_id, user.uid)

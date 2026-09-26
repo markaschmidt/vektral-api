@@ -78,22 +78,16 @@ async def git_file(workspace_id: str, path: str) -> dict[str, Any]:
     )
 
 
-async def git_tree(workspace_id: str, path: str = "") -> dict[str, Any]:
-    suffix = f"?path={path}" if path else ""
+async def git_head(workspace_id: str) -> dict[str, Any]:
     return await preview_runner_request(
-        "GET",
-        f"/v1/git/{workspace_id}/tree{suffix}",
-        None,
-        timeout=30.0,
+        "GET", f"/v1/git/{workspace_id}/head", None, timeout=20.0
     )
 
 
-async def git_file(workspace_id: str, path: str) -> dict[str, Any]:
-    from urllib.parse import quote
-
+async def apply_workspace_mutation(workspace_id: str, body: dict[str, Any]) -> dict[str, Any]:
     return await preview_runner_request(
-        "GET",
-        f"/v1/git/{workspace_id}/file?path={quote(path)}",
-        None,
-        timeout=30.0,
+        "POST",
+        f"/v1/workspaces/{workspace_id}/mutations",
+        body,
+        timeout=180.0,
     )

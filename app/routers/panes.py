@@ -36,6 +36,8 @@ async def api_create_pane(
         route=body.route,
         layout_json=body.layout_json,
         kind=body.kind,
+        source_kind=body.source_kind,
+        external_url=body.external_url,
     )
 
 
@@ -54,6 +56,8 @@ async def api_update_pane(
         route=body.route,
         layout_json=body.layout_json,
         kind=body.kind,
+        source_kind=body.source_kind,
+        external_url=body.external_url,
     )
     if updated is None:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "pane not found"})
@@ -85,3 +89,14 @@ async def api_activate_chat_pane(
     user: Annotated[VerifiedUser, Depends(current_user)],
 ) -> dict[str, Any]:
     return panes_svc.activate_chat_pane(workspace_id, pane_id, user.uid)
+
+
+@router.post("/api/workspaces/{workspace_id}/panes/{pane_id}/launch")
+async def api_launch_pane(
+    workspace_id: str,
+    pane_id: str,
+    user: Annotated[VerifiedUser, Depends(current_user)],
+) -> dict[str, Any]:
+    from app.services import preview as preview_svc
+
+    return await preview_svc.launch_pane(workspace_id, pane_id, user.uid)

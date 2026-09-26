@@ -86,11 +86,29 @@ class Settings:
         ).rstrip("/")
         self.collab_internal_url = self.preview_runner_url
         self.preview_public_base = os.environ.get(
-            "PREVIEW_PUBLIC_BASE", "http://127.0.0.1:8790/proxy"
+            "PREVIEW_PUBLIC_BASE", "http://p-{session}.localhost:8790"
         ).rstrip("/")
         self.preview_runner_public_host = os.environ.get(
             "PREVIEW_RUNNER_PUBLIC_HOST", "http://127.0.0.1"
         ).rstrip("/")
+        self.preview_ticket_secret = os.environ.get("PREVIEW_TICKET_SECRET", "").strip()
+        self.preview_isolated_origin_template = os.environ.get(
+            "PREVIEW_ISOLATED_ORIGIN_TEMPLATE",
+            "http://p-{session}.localhost:8790",
+        ).rstrip("/")
+        self.preview_ticket_ttl_seconds = int(os.environ.get("PREVIEW_TICKET_TTL_SECONDS", "60"))
+        self.preview_session_ttl_seconds = int(
+            os.environ.get("PREVIEW_SESSION_TTL_SECONDS", "900")
+        )
+        self.preview_session_grace_seconds = int(
+            os.environ.get("PREVIEW_SESSION_GRACE_SECONDS", "20")
+        )
+        self.preview_ready_timeout_seconds = int(
+            os.environ.get("PREVIEW_READY_TIMEOUT_SECONDS", "20")
+        )
+        self.captures_enabled = _bool("CAPTURES_ENABLED", False)
+        self.capture_ttl_seconds = int(os.environ.get("CAPTURE_TTL_SECONDS", "600"))
+        self.preview_expo_web = _bool("PREVIEW_EXPO_WEB", False)
 
         # Optional GH token for preview when user has not connected GitHub yet
         self.github_token_fallback = (
@@ -156,6 +174,34 @@ class Settings:
         ).strip()
 
         self.token_encryption_key = os.environ.get("TOKEN_ENCRYPTION_KEY", "").strip()
+
+        # AI avatar embodiment (semantic attend/plans only — no world coordinates)
+        self.embodiment_enabled = _bool("EMBODIMENT_ENABLED", False)
+        self.embodiment_model = os.environ.get(
+            "EMBODIMENT_MODEL", "mistral-small-latest"
+        ).strip()
+        self.embodiment_plan_ttl_seconds = int(
+            os.environ.get("EMBODIMENT_PLAN_TTL_SECONDS", "120")
+        )
+        self.embodiment_context_ttl_seconds = int(
+            os.environ.get("EMBODIMENT_CONTEXT_TTL_SECONDS", "300")
+        )
+
+        # Dialogue-orchestrated pane/avatar/job actions (staged rollout)
+        self.dialogue_orchestration_enabled = _bool(
+            "DIALOGUE_ORCHESTRATION_ENABLED", False
+        )
+        stage = os.environ.get(
+            "DIALOGUE_ORCHESTRATION_STAGE", "shadow"
+        ).strip().lower()
+        if stage not in {
+            "shadow",
+            "user_pane_avatar",
+            "queued_edits",
+            "assistant_avatar",
+        }:
+            stage = "shadow"
+        self.dialogue_orchestration_stage = stage
 
         # Local/dev: Bearer "dev" or "dev:<uid>" — never enable in production
         self.allow_dev_bearer = _bool("ALLOW_DEV_BEARER", False) or _bool(

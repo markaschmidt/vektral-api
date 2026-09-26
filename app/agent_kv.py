@@ -23,6 +23,8 @@ _memory: dict[str, dict[str, dict[str, Any]]] = {
     "preview_sessions": {},
     "messages": {},
     "pane_state": {},
+    "preview_tickets": {},
+    "captures": {},
 }
 
 
@@ -103,6 +105,57 @@ def query_eq(collection: str, field: str, value: Any) -> list[dict[str, Any]]:
         ]
 
 
+def increment_counter(collection: str, doc_id: str, field: str = "revision") -> int:
+    """Process-local atomic increment used for plan/turn revisions."""
+    with _lock:
+        doc = get_doc(collection, doc_id) or {}
+        n = int(doc.get(field) or 0) + 1
+        payload = {**doc, "id": doc_id, field: n, "updated_at": now_iso()}
+        put_doc(collection, doc_id, payload)
+        return n
+
+
+def create_if_absent(
+    collection: str, doc_id: str, data: dict[str, Any]
+) -> tuple[bool, dict[str, Any]]:
+    """Atomically create ``data`` when ``doc_id`` is missing.
+
+    Firestore uses a transaction; the in-memory store uses the module lock.
+    Returns ``(created, current_document)``.
+    """
+    payload = {**data, "id": doc_id}
+    db = _db()
+    if db is not None:
+        try:
+            from firebase_admin import firestore as fb_fs
+
+            ref = db.collection(collection).document(doc_id)
+
+            @fb_fs.transactional
+            def _txn(transaction):  # type: ignore[no-untyped-def]
+                snap = ref.get(transaction=transaction)
+                if snap.exists:
+                    existing = snap.to_dict() or {}
+                    existing.setdefault("id", doc_id)
+                    return False, existing
+                transaction.set(ref, payload)
+                return True, dict(payload)
+
+            return _txn(db.transaction())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "agent_kv create_if_absent %s/%s failed: %s", collection, doc_id, exc
+            )
+    with _lock:
+        col = _memory.setdefault(collection, {})
+        existing = col.get(doc_id)
+        if existing is not None:
+            return False, dict(existing)
+        stored = dict(payload)
+        col[doc_id] = stored
+        return True, dict(stored)
+
+
 def clear_memory() -> None:
     """Reset in-memory agent collections (tests)."""
     with _lock:
@@ -110,4 +163,13 @@ def clear_memory() -> None:
             col.clear()
 
 
-__all__ = ["now_iso", "new_id", "put_doc", "get_doc", "query_eq", "clear_memory"]
+__all__ = [
+    "now_iso",
+    "new_id",
+    "put_doc",
+    "get_doc",
+    "query_eq",
+    "increment_counter",
+    "create_if_absent",
+    "clear_memory",
+]

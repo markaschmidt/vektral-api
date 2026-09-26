@@ -215,7 +215,7 @@ def _auth_headers(token: str) -> dict[str, str]:
 
 def _upstream(message: str) -> HTTPException:
     return HTTPException(
-        status_code=502,
+        status_code=424,
         detail={"error": "linear_upstream", "message": message},
     )
 
@@ -259,12 +259,30 @@ async def graphql(
         raise _upstream(str(exc)) from exc
 
     data = resp.json() if resp.content else {}
+    if resp.status_code in (401, 403):
+        logger.warning("Linear GraphQL HTTP %s: %s", resp.status_code, str(data)[:300])
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "error": "linear_reauth_required",
+                "message": "Linear access expired. Reconnect Linear under Integrations.",
+            },
+        )
     if resp.status_code >= 400:
         logger.warning("Linear GraphQL HTTP %s: %s", resp.status_code, str(data)[:300])
         raise _upstream(f"Linear HTTP {resp.status_code}")
     errors = data.get("errors")
     if errors:
         msg = str(errors[0].get("message") if isinstance(errors[0], dict) else errors[0])
+        lower = msg.lower()
+        if "auth" in lower or "unauthorized" in lower or "not authenticated" in lower:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "error": "linear_reauth_required",
+                    "message": "Linear access expired. Reconnect Linear under Integrations.",
+                },
+            )
         raise _upstream(msg[:400])
     payload = data.get("data")
     if not isinstance(payload, dict):
@@ -393,6 +411,63 @@ async def list_projects(
     return out
 
 
+def empty_linear_labels() -> dict[str, str]:
+    return {
+        "linear_project_name": "",
+        "linear_project_url": "",
+        "linear_team_name": "",
+        "linear_organization_id": "",
+        "linear_organization_name": "",
+    }
+
+
+def labels_from_catalog(
+    projects: list[dict[str, Any]],
+    teams: list[dict[str, Any]],
+    project_id: str = "",
+    team_id: str = "",
+) -> dict[str, str]:
+    labels = empty_linear_labels()
+    pid = (project_id or "").strip()
+    tid = (team_id or "").strip()
+    if pid:
+        match = next((p for p in projects if p.get("id") == pid), None)
+        if match:
+            labels["linear_project_name"] = str(match.get("name") or "")
+            labels["linear_project_url"] = str(match.get("url") or "")
+            if not tid:
+                tid = str(match.get("team_id") or "")
+            labels["linear_team_name"] = str(match.get("team_name") or "")
+    if tid:
+        team = next((t for t in teams if t.get("id") == tid), None)
+        if team:
+            labels["linear_team_name"] = str(team.get("name") or "") or labels[
+                "linear_team_name"
+            ]
+            labels["linear_organization_id"] = str(team.get("organization_id") or "")
+            labels["linear_organization_name"] = str(
+                team.get("organization_name") or ""
+            )
+    return labels
+
+
+async def labels_for_ids(
+    token: str, project_id: str = "", team_id: str = ""
+) -> dict[str, str]:
+    """Resolve Linear project/team/org display names for stored ids."""
+    pid = (project_id or "").strip()
+    tid = (team_id or "").strip()
+    if not pid and not tid:
+        return empty_linear_labels()
+    try:
+        projects = await list_projects(token) if pid else []
+        teams = await list_teams(token)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("linear label lookup failed: %s", exc)
+        return empty_linear_labels()
+    return labels_from_catalog(projects, teams, pid, tid)
+
+
 async def create_project(
     token: str,
     *,
@@ -427,13 +502,13 @@ async def create_project(
     result = data.get("projectCreate") or {}
     if not result.get("success"):
         raise HTTPException(
-            status_code=502,
+            status_code=424,
             detail={"error": "linear_upstream", "message": "Linear project creation failed"},
         )
     created = result.get("project")
     if not isinstance(created, dict):
         raise HTTPException(
-            status_code=502,
+            status_code=424,
             detail={"error": "linear_upstream", "message": "Linear returned no project"},
         )
     return _project_view(created)

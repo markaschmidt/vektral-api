@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 from urllib.parse import quote, urlencode
@@ -27,6 +28,7 @@ from app.schemas import (
     LinearTeamView,
 )
 from app.services import linear_client as linear_svc
+from app.services.oauth_refresh import ensure_linear_access_token
 from app.store import get_store
 
 logger = logging.getLogger("vektral.linear")
@@ -46,8 +48,28 @@ def _redirect_uri() -> str:
     return f"{s.api_public_url}/sso/linear/callback"
 
 
-def _token_for(uid: str) -> str:
-    return get_store().linear_access_token(uid)
+def _token_for(uid: str, *, force: bool = False) -> str:
+    return ensure_linear_access_token(uid, force=force)
+
+
+async def _call_linear(
+    uid: str,
+    call: Callable[[str], Awaitable[Any]],
+    *,
+    empty: Any,
+) -> Any:
+    token = _token_for(uid)
+    if not token:
+        return empty
+    try:
+        return await call(token)
+    except HTTPException as exc:
+        if exc.status_code != 401:
+            raise
+        token = _token_for(uid, force=True)
+        if not token:
+            raise
+        return await call(token)
 
 
 @router.get("/api/linear/status", response_model=LinearStatus)
@@ -114,10 +136,7 @@ async def linear_disconnect(
 async def list_linear_organizations(
     user: Annotated[VerifiedUser, Depends(current_user)],
 ) -> list[dict[str, Any]]:
-    token = _token_for(user.uid)
-    if not token:
-        return []
-    return await linear_svc.list_organizations(token)
+    return await _call_linear(user.uid, linear_svc.list_organizations, empty=[])
 
 
 @router.get("/api/linear/teams", response_model=list[LinearTeamView])
@@ -125,10 +144,11 @@ async def list_linear_teams(
     user: Annotated[VerifiedUser, Depends(current_user)],
     organization_id: str = "",
 ) -> list[dict[str, Any]]:
-    token = _token_for(user.uid)
-    if not token:
-        return []
-    return await linear_svc.list_teams(token, organization_id=organization_id)
+    return await _call_linear(
+        user.uid,
+        lambda token: linear_svc.list_teams(token, organization_id=organization_id),
+        empty=[],
+    )
 
 
 @router.get("/api/linear/projects", response_model=list[LinearProjectView])
@@ -137,10 +157,11 @@ async def list_linear_projects(
     team_id: str = "",
 ) -> list[dict[str, Any]]:
     """Linear workspace projects for the connected account (optional team filter)."""
-    token = _token_for(user.uid)
-    if not token:
-        return []
-    return await linear_svc.list_projects(token, team_id=(team_id or "").strip())
+    return await _call_linear(
+        user.uid,
+        lambda token: linear_svc.list_projects(token, team_id=(team_id or "").strip()),
+        empty=[],
+    )
 
 
 @router.post("/api/linear/projects", response_model=LinearProjectView, status_code=201)
@@ -163,12 +184,23 @@ async def create_linear_project(
             logger.exception("Linear status Firestore read failed")
             raise storage_unavailable() from exc
         team_id = str(status.get("default_team_id") or "").strip()
-    return await linear_svc.create_project(
-        token,
-        name=body.name,
-        description=body.description or "",
-        team_id=team_id,
-    )
+    async def _create(token: str) -> dict[str, Any]:
+        return await linear_svc.create_project(
+            token,
+            name=body.name,
+            description=body.description or "",
+            team_id=team_id,
+        )
+
+    try:
+        return await _create(token)
+    except HTTPException as exc:
+        if exc.status_code != 401:
+            raise
+        token = _token_for(user.uid, force=True)
+        if not token:
+            raise
+        return await _create(token)
 
 
 @router.post("/api/linear/defaults", response_model=LinearStatus)

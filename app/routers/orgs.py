@@ -193,6 +193,11 @@ async def create_org_workspace(
         org_id=org_id,
         create_github_repo=body.create_github_repo,
         github_repo_private=body.github_repo_private,
+        linear_project_id=body.linear_project_id or "",
+        linear_team_id=body.linear_team_id or "",
     )
+    ws = await ws_svc.apply_linear_labels(user.uid, ws)
     await preview_svc.seed_starter_checkout(ws["id"], user.uid)
-    return ws
+    from app.schemas import workspace_view
+
+    return workspace_view(ws_svc.require_workspace_access(ws["id"], user.uid))

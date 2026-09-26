@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -19,6 +20,7 @@ def client(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("ALLOW_DEV_BEARER", "true")
     monkeypatch.setenv("VEKTRAL_USE_MEMORY_STORE", "true")
     monkeypatch.setenv("FIREBASE_STUB_MODE", "true")
+    monkeypatch.setenv("DIALOGUE_ORCHESTRATION_ENABLED", "false")
 
     from app.config import get_settings
     from app.store import reset_memory_store, set_store_override
@@ -54,7 +56,12 @@ def _connect_linear(uid: str = "alice") -> None:
     )
 
 
-def test_linear_status_disconnected(client: TestClient):
+def test_linear_status_disconnected(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LINEAR_CLIENT_ID", "")
+    monkeypatch.setenv("LINEAR_CLIENT_SECRET", "")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
     assert client.get("/api/linear/status").status_code == 401
     res = client.get("/api/linear/status", headers=AUTH_A)
     assert res.status_code == 200
@@ -396,3 +403,146 @@ def test_run_linear_job_executes_plan(client: TestClient):
     out = asyncio.run(_run())
     assert out["status"] == "ready"
     assert "ENG-10" in out["result_json"]
+
+
+def test_workspace_create_resolves_linear_names(client: TestClient):
+    _connect_linear()
+    projects = [
+        {
+            "id": "proj1",
+            "name": "Platform",
+            "url": "https://linear.app/acme/project/platform",
+            "team_id": "team1",
+            "team_name": "Engineering",
+            "teams": [{"id": "team1", "name": "Engineering", "key": "ENG"}],
+        }
+    ]
+    teams = [
+        {
+            "id": "team1",
+            "name": "Engineering",
+            "organization_id": "org1",
+            "organization_name": "Acme Labs",
+        }
+    ]
+    with (
+        patch(
+            "app.services.preview.seed_starter_checkout",
+            new=AsyncMock(return_value={"ok": True, "skipped": True}),
+        ),
+        patch(
+            "app.services.linear_client.list_projects",
+            new=AsyncMock(return_value=projects),
+        ),
+        patch(
+            "app.services.linear_client.list_teams",
+            new=AsyncMock(return_value=teams),
+        ),
+    ):
+        created = client.post(
+            "/api/workspaces",
+            headers=AUTH_A,
+            json={
+                "name": "Named Linear",
+                "linear_project_id": "proj1",
+                "linear_team_id": "team1",
+            },
+        )
+    assert created.status_code == 201
+    body = created.json()
+    assert body["linear_project_name"] == "Platform"
+    assert body["linear_team_name"] == "Engineering"
+    assert body["linear_organization_name"] == "Acme Labs"
+    listed = client.get("/api/workspaces", headers=AUTH_A)
+    assert listed.json()[0]["linear_project_name"] == "Platform"
+
+
+def test_linear_organizations_refreshes_expired_token(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("LINEAR_CLIENT_ID", "lin-id")
+    monkeypatch.setenv("LINEAR_CLIENT_SECRET", "lin-secret")
+    from app.config import get_settings
+    from app.store import get_store
+
+    get_settings.cache_clear()
+    expired = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    store = get_store()
+    store.linear_save_pending("st-exp", "alice")
+    store.linear_complete(
+        "st-exp",
+        user_id="user_1",
+        name="Alice",
+        email="alice@dev.local",
+        access_token="lin_old",
+        refresh_token="lin_refresh",
+        expires_at=expired,
+        scopes="read",
+    )
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+            self.content = b"{}"
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, **kwargs):
+            assert "oauth/token" in url
+            return FakeResponse(
+                {
+                    "access_token": "lin_new",
+                    "refresh_token": "lin_refresh_2",
+                    "expires_in": 86399,
+                }
+            )
+
+    fake_orgs = [
+        {"id": "", "name": "Personal", "url_key": "", "scope": "personal"},
+        {"id": "org1", "name": "Acme", "url_key": "acme", "scope": "organization"},
+    ]
+    with (
+        patch("app.services.oauth_refresh.httpx.Client", FakeClient),
+        patch(
+            "app.routers.linear.linear_svc.list_organizations",
+            new=AsyncMock(return_value=fake_orgs),
+        ),
+    ):
+        res = client.get("/api/linear/organizations", headers=AUTH_A)
+    assert res.status_code == 200
+    assert any(row["id"] == "org1" for row in res.json())
+    assert get_store().linear_access_token("alice") == "lin_new"
+
+
+def test_linear_organizations_expired_without_refresh_is_401_not_502(
+    client: TestClient,
+):
+    expired = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    from app.store import get_store
+    store = get_store()
+    store.linear_save_pending("st-dead", "alice")
+    store.linear_complete(
+        "st-dead",
+        user_id="user_1",
+        name="Alice",
+        email="alice@dev.local",
+        access_token="lin_old",
+        refresh_token="",
+        expires_at=expired,
+        scopes="read",
+    )
+    res = client.get("/api/linear/organizations", headers=AUTH_A)
+    assert res.status_code == 401
+    assert res.json()["detail"]["error"] == "linear_reauth_required"

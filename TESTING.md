@@ -277,3 +277,47 @@ uvicorn app.main:app --host 0.0.0.0 --port 8788
 
 This service is plain FastAPI. There is **no** `jac-agent` container, no `jac start`,
 no OSP graph. See [JAC_AGENT_CUTOVER.md](JAC_AGENT_CUTOVER.md).
+
+## 9. Embodiment (semantic NPC plans)
+
+Default **off** (`EMBODIMENT_ENABLED=false`). Context/receipts still work. Command
+responses include `embodiment_json` only when the flag is true.
+
+```bash
+export EMBODIMENT_ENABLED=true
+export EMBODIMENT_MODEL=mistral-small-latest
+
+# Debounced focus (pane ids only — never Vec3)
+curl -sS -X PUT -H "Authorization: Bearer $ID_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"client_revision":1,"primary_pane_id":"'"$PANE_ID"'","focused_pane_ids":["'"$PANE_ID"'"]}' \
+  http://127.0.0.1:8788/api/workspaces/$WS_ID/agent-context | jq .
+
+curl -sS -H "Authorization: Bearer $ID_TOKEN" \
+  http://127.0.0.1:8788/api/workspaces/$WS_ID/embodiment/state | jq .
+
+# After a command, forward APEX onPlanEvent
+curl -sS -X POST -H "Authorization: Bearer $ID_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"plan_id":"plan_…","revision":1,"status":"completed"}' \
+  http://127.0.0.1:8788/api/workspaces/$WS_ID/embodiment/receipts | jq .
+```
+
+Pytest: `python -m pytest tests/test_embodiment.py tests/test_dialogue.py tests/test_panes_chat.py`.
+APEX: `pnpm --filter @apex-vr/agents test`.
+
+## 10. Dialogue orchestration (staged)
+
+Default **off** (`DIALOGUE_ORCHESTRATION_ENABLED=false`). Existing regex dispatch
+remains the rollback path.
+
+```bash
+export DIALOGUE_ORCHESTRATION_ENABLED=true
+export DIALOGUE_ORCHESTRATION_STAGE=user_pane_avatar  # then queued_edits, then assistant_avatar
+
+curl -sS -X POST -H "Authorization: Bearer $ID_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"turn_id":"turn_dev_1","role":"user","text":"open about and walk over","is_final":true}' \
+  http://127.0.0.1:8788/api/workspaces/$WS_ID/dialogue/turns | jq .
+```
+

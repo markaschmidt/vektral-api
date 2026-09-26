@@ -131,6 +131,17 @@ def list_openrouter_models() -> dict[str, Any]:
     return {"default_model": default_model, "models": models}
 
 
+def embodiment_model_id() -> str:
+    """Backend-controlled lightweight planner. Not exposed in the user picker."""
+    s = get_settings()
+    pick = (s.embodiment_model or "").strip()
+    if pick:
+        return pick
+    if s.mistral_api_key:
+        return "mistral-small-latest"
+    return s.openrouter_model or "mistral-small-latest"
+
+
 def resolve_openrouter_model(requested: str = "") -> dict[str, str]:
     catalog_result = list_openrouter_models()
     default_model = catalog_result["default_model"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -74,11 +75,31 @@ def test_workspace_crud_flow(client: TestClient):
     assert got.status_code == 200
     assert got.json()["name"] == "Orbital Notes"
 
-    patched = client.patch(
-        f"/api/workspaces/{wid}",
-        headers=AUTH_A,
-        json={"name": "Renamed", "repo_full_name": "alice/orbital"},
+    from app.store import get_store
+
+    store = get_store()
+    store.github_save_pending("st-crud", "alice")
+    store.github_complete(
+        "st-crud",
+        login="alice",
+        access_token="gho_test",
+        scopes="repo",
     )
+    with (
+        patch(
+            "app.services.workspaces.gh_repos.verify_repo_access",
+            return_value={"full_name": "alice/orbital", "accessible": True, "reason": ""},
+        ),
+        patch(
+            "app.services.preview.seed_starter_checkout",
+            new_callable=AsyncMock,
+        ),
+    ):
+        patched = client.patch(
+            f"/api/workspaces/{wid}",
+            headers=AUTH_A,
+            json={"name": "Renamed", "repo_full_name": "alice/orbital"},
+        )
     assert patched.status_code == 200
     assert patched.json()["name"] == "Renamed"
     assert patched.json()["repo_full_name"] == "alice/orbital"
